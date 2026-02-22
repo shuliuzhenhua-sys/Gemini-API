@@ -202,3 +202,5 @@ Temporary Items
 
 # Temporary files
 .temp/
+.outputs/
+outputs/
