@@ -119,6 +119,10 @@ services:
 
 ## Usage
 
+> [!NOTE]
+>
+> 官方格式兼容的图片 HTTP API 文档请见：`docs/GEMINI_IMAGE_API_COMPAT.md`
+
 ### Initialization
 
 Import required packages and initialize a client with your cookies obtained from the previous step. After a successful initialization, the API will automatically refresh `__Secure-1PSIDTS` in background as long as the process is alive.

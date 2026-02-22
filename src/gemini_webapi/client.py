@@ -578,6 +578,10 @@ class GeminiClient(GemMixin):
                 f"string, or dictionary; got `{type(model).__name__}`"
             )
 
+        # Use flash-thinking as default when caller does not explicitly set model.
+        if model is Model.UNSPECIFIED:
+            model = Model.G_3_0_FLASH_THINKING
+
         _reqid = self._reqid
         self._reqid += 100000
 

@@ -56,7 +56,7 @@ async def upload_file(
     elif isinstance(file, io.BytesIO):
         file_content = file.getvalue()
         if not filename:
-            filename = _generate_random_name()
+            filename = Path(getattr(file, "name", "")).name or _generate_random_name()
     elif isinstance(file, bytes):
         file_content = file
         if not filename:
@@ -95,5 +95,8 @@ def parse_file_name(file: str | Path | bytes | io.BytesIO) -> str:
         if not file.is_file():
             raise ValueError(f"{file} is not a valid file.")
         return file.name
+
+    if isinstance(file, io.BytesIO):
+        return Path(getattr(file, "name", "")).name or _generate_random_name()
 
     return _generate_random_name()
