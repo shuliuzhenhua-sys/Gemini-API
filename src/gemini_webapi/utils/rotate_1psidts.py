@@ -1,11 +1,16 @@
 import os
 import time
+import asyncio
+import random
 from pathlib import Path
 
 from httpx import AsyncClient, Cookies
 
 from ..constants import Endpoint, Headers
 from ..exceptions import AuthError
+
+_ROTATE_TIMEOUT = 30
+_ROTATE_RETRIES = 3
 
 
 async def rotate_1psidts(
@@ -60,19 +65,31 @@ async def rotate_1psidts(
     if path.is_file() and time.time() - os.path.getmtime(path) <= 60:
         return path.read_text(), None
 
-    async with AsyncClient(http2=True, proxy=proxy) as client:
-        response = await client.post(
-            url=Endpoint.ROTATE_COOKIES,
-            headers=Headers.ROTATE_COOKIES.value,
-            cookies=cookies,
-            content='[000,"-0000000000000000000"]',
-        )
-        if response.status_code == 401:
-            raise AuthError
-        response.raise_for_status()
+    last_exc: Exception | None = None
+    for attempt in range(_ROTATE_RETRIES):
+        try:
+            async with AsyncClient(http2=True, proxy=proxy, timeout=_ROTATE_TIMEOUT) as client:
+                response = await client.post(
+                    url=Endpoint.ROTATE_COOKIES,
+                    headers=Headers.ROTATE_COOKIES.value,
+                    cookies=cookies,
+                    content='[000,"-0000000000000000000"]',
+                )
+                if response.status_code == 401:
+                    raise AuthError
+                response.raise_for_status()
 
-        if new_1psidts := response.cookies.get("__Secure-1PSIDTS"):
-            path.write_text(new_1psidts)
-            return new_1psidts, response.cookies
+                if new_1psidts := response.cookies.get("__Secure-1PSIDTS"):
+                    path.write_text(new_1psidts)
+                    return new_1psidts, response.cookies
 
-        return None, response.cookies
+                return None, response.cookies
+        except AuthError:
+            raise
+        except Exception as e:
+            last_exc = e
+            if attempt < _ROTATE_RETRIES - 1:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                await asyncio.sleep(delay)
+
+    raise last_exc

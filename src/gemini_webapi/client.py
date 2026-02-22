@@ -71,6 +71,7 @@ class GeminiClient(GemMixin):
     __slots__ = [
         "cookies",
         "proxy",
+        "http2",
         "_running",
         "client",
         "access_token",
@@ -101,6 +102,7 @@ class GeminiClient(GemMixin):
         super().__init__()
         self.cookies = Cookies()
         self.proxy = proxy
+        self.http2 = kwargs.pop("http2", True)
         self._running: bool = False
         self.client: AsyncClient | None = None
         self.access_token: str | None = None
@@ -170,13 +172,14 @@ class GeminiClient(GemMixin):
                     await get_access_token(
                         base_cookies=self.cookies,
                         proxy=self.proxy,
+                        http2=self.http2,
                         verbose=self.verbose,
                         verify=self.kwargs.get("verify", True),
                     )
                 )
 
                 self.client = AsyncClient(
-                    http2=True,
+                    http2=self.http2,
                     timeout=timeout,
                     proxy=self.proxy,
                     follow_redirects=True,
@@ -252,6 +255,7 @@ class GeminiClient(GemMixin):
     async def start_auto_refresh(self) -> None:
         """
         Start the background task to automatically refresh cookies.
+        If the client becomes disconnected, attempts to re-initialize automatically.
         """
         if self.refresh_interval < 60:
             self.refresh_interval = 60
@@ -264,6 +268,26 @@ class GeminiClient(GemMixin):
 
             try:
                 async with self._lock:
+                    # If client dropped (e.g. due to a zombie stream closing it), try to reinit
+                    if not self._running:
+                        logger.warning(
+                            "Client is not running during auto-refresh. Attempting re-initialization..."
+                        )
+                        try:
+                            await self.init(
+                                timeout=self.timeout,
+                                auto_close=self.auto_close,
+                                close_delay=self.close_delay,
+                                auto_refresh=False,  # avoid spawning nested refresh task
+                                refresh_interval=self.refresh_interval,
+                                verbose=self.verbose,
+                                watchdog_timeout=self.watchdog_timeout,
+                            )
+                            logger.success("Client re-initialized successfully after disconnect.")
+                        except Exception as reinit_err:
+                            logger.warning(f"Re-initialization failed: {reinit_err}. Will retry next interval.")
+                        continue
+
                     # Refresh all cookies in the background to keep the session alive.
                     new_1psidts, rotated_cookies = await rotate_1psidts(
                         self.cookies, self.proxy

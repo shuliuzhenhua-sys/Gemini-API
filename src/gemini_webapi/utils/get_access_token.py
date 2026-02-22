@@ -1,7 +1,7 @@
 import os
 import re
 import asyncio
-from asyncio import Task
+import random
 from pathlib import Path
 
 from httpx import AsyncClient, Cookies, Response
@@ -11,29 +11,51 @@ from ..exceptions import AuthError
 from .load_browser_cookies import load_browser_cookies
 from .logger import logger
 
+# Default timeout for init-stage HTTP requests (seconds)
+_INIT_TIMEOUT = 30
+# Max retries for send_request
+_SEND_REQUEST_RETRIES = 3
+
 
 async def send_request(
-    cookies: dict | Cookies, proxy: str | None = None
+    cookies: dict | Cookies, proxy: str | None = None, http2: bool = True
 ) -> tuple[Response | None, Cookies]:
     """
     Send http request with provided cookies.
+    Retries up to _SEND_REQUEST_RETRIES times with exponential backoff on transient failures.
     """
 
-    async with AsyncClient(
-        http2=True,
-        proxy=proxy,
-        headers=Headers.GEMINI.value,
-        cookies=cookies,
-        follow_redirects=True,
-    ) as client:
-        response = await client.get(Endpoint.INIT)
-        response.raise_for_status()
-        return response, client.cookies
+    last_exc: Exception | None = None
+    for attempt in range(_SEND_REQUEST_RETRIES):
+        try:
+            async with AsyncClient(
+                http2=http2,
+                proxy=proxy,
+                headers=Headers.GEMINI.value,
+                cookies=cookies,
+                follow_redirects=True,
+                timeout=_INIT_TIMEOUT,
+            ) as client:
+                response = await client.get(Endpoint.INIT)
+                response.raise_for_status()
+                return response, client.cookies
+        except Exception as e:
+            last_exc = e
+            if attempt < _SEND_REQUEST_RETRIES - 1:
+                delay = (2 ** attempt) + random.uniform(0, 1)
+                logger.debug(
+                    f"send_request attempt {attempt + 1}/{_SEND_REQUEST_RETRIES} failed: {e}. "
+                    f"Retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+
+    raise last_exc
 
 
 async def get_access_token(
     base_cookies: dict | Cookies,
     proxy: str | None = None,
+    http2: bool = True,
     verbose: bool = False,
     verify: bool = True,
 ) -> tuple[str, Cookies, str | None, str | None]:
@@ -68,23 +90,33 @@ async def get_access_token(
         If all requests failed.
     """
 
-    async with AsyncClient(
-        http2=True, proxy=proxy, follow_redirects=True, verify=verify
-    ) as client:
-        response = await client.get(Endpoint.GOOGLE)
-
     extra_cookies = Cookies()
-    if response.status_code == 200:
-        extra_cookies = response.cookies
+    try:
+        async with AsyncClient(
+            http2=http2,
+            proxy=proxy,
+            follow_redirects=True,
+            verify=verify,
+            timeout=_INIT_TIMEOUT,
+        ) as client:
+            response = await client.get(Endpoint.GOOGLE)
+        if response.status_code == 200:
+            extra_cookies = response.cookies
+    except Exception as e:
+        # Pre-fetching google.com cookies is best-effort; do not abort initialization on failure
+        logger.debug(f"Pre-fetch google.com failed (non-fatal): {e}")
 
     tasks = []
+    has_full_base_cookies = (
+        "__Secure-1PSID" in base_cookies and "__Secure-1PSIDTS" in base_cookies
+    )
 
     # Base cookies passed directly on initializing client
     # We use a Jar to merge extra_cookies and base_cookies safely (preserving domains)
-    if "__Secure-1PSID" in base_cookies and "__Secure-1PSIDTS" in base_cookies:
+    if has_full_base_cookies:
         jar = Cookies(extra_cookies)
         jar.update(base_cookies)
-        tasks.append(Task(send_request(jar, proxy=proxy)))
+        tasks.append(asyncio.ensure_future(send_request(jar, proxy=proxy, http2=http2)))
     elif verbose:
         logger.debug(
             "Skipping loading base cookies. Either __Secure-1PSID or __Secure-1PSIDTS is not provided."
@@ -114,7 +146,7 @@ async def get_access_token(
                 jar = Cookies(extra_cookies)
                 jar.update(base_cookies)
                 jar.set("__Secure-1PSIDTS", cached_1psidts, domain=".google.com")
-                tasks.append(Task(send_request(jar, proxy=proxy)))
+                tasks.append(asyncio.ensure_future(send_request(jar, proxy=proxy, http2=http2)))
             elif verbose:
                 logger.debug("Skipping loading cached cookies. Cache file is empty.")
         elif verbose:
@@ -129,7 +161,7 @@ async def get_access_token(
                 psid = cache_file.stem[16:]
                 jar.set("__Secure-1PSID", psid, domain=".google.com")
                 jar.set("__Secure-1PSIDTS", cached_1psidts, domain=".google.com")
-                tasks.append(Task(send_request(jar, proxy=proxy)))
+                tasks.append(asyncio.ensure_future(send_request(jar, proxy=proxy, http2=http2)))
                 valid_caches += 1
 
         if valid_caches == 0 and verbose:
@@ -138,79 +170,90 @@ async def get_access_token(
             )
 
     # Browser cookies (if browser-cookie3 is installed)
-    try:
-        valid_browser_cookies = 0
-        browser_cookies = load_browser_cookies(
-            domain_name="google.com", verbose=verbose
-        )
-        if browser_cookies:
-            for browser, cookies in browser_cookies.items():
-                if secure_1psid := cookies.get("__Secure-1PSID"):
-                    if (
-                        "__Secure-1PSID" in base_cookies
-                        and base_cookies["__Secure-1PSID"] != secure_1psid
-                    ):
+    # If caller already provided full cookie pair, avoid mixing other local browser
+    # sessions to keep request identity stable across retries.
+    if not has_full_base_cookies:
+        try:
+            valid_browser_cookies = 0
+            browser_cookies = load_browser_cookies(
+                domain_name="google.com", verbose=verbose
+            )
+            if browser_cookies:
+                for browser, cookies in browser_cookies.items():
+                    if secure_1psid := cookies.get("__Secure-1PSID"):
+                        if (
+                            "__Secure-1PSID" in base_cookies
+                            and base_cookies["__Secure-1PSID"] != secure_1psid
+                        ):
+                            if verbose:
+                                logger.debug(
+                                    f"Skipping loading local browser cookies from {browser}. "
+                                    f"__Secure-1PSID does not match the one provided."
+                                )
+                            continue
+
+                        local_cookies = {"__Secure-1PSID": secure_1psid}
+                        if secure_1psidts := cookies.get("__Secure-1PSIDTS"):
+                            local_cookies["__Secure-1PSIDTS"] = secure_1psidts
+                        if nid := cookies.get("NID"):
+                            local_cookies["NID"] = nid
+                        tasks.append(
+                            asyncio.ensure_future(send_request(local_cookies, proxy=proxy, http2=http2))
+                        )
+                        valid_browser_cookies += 1
                         if verbose:
-                            logger.debug(
-                                f"Skipping loading local browser cookies from {browser}. "
-                                f"__Secure-1PSID does not match the one provided."
-                            )
-                        continue
+                            logger.debug(f"Loaded local browser cookies from {browser}")
 
-                    local_cookies = {"__Secure-1PSID": secure_1psid}
-                    if secure_1psidts := cookies.get("__Secure-1PSIDTS"):
-                        local_cookies["__Secure-1PSIDTS"] = secure_1psidts
-                    if nid := cookies.get("NID"):
-                        local_cookies["NID"] = nid
-                    tasks.append(Task(send_request(local_cookies, proxy=proxy)))
-                    valid_browser_cookies += 1
-                    if verbose:
-                        logger.debug(f"Loaded local browser cookies from {browser}")
-
-        if valid_browser_cookies == 0 and verbose:
-            logger.debug(
-                "Skipping loading local browser cookies. Login to gemini.google.com in your browser first."
-            )
-    except ImportError:
-        if verbose:
-            logger.debug(
-                "Skipping loading local browser cookies. Optional dependency 'browser-cookie3' is not installed."
-            )
-    except Exception as e:
-        if verbose:
-            logger.warning(f"Skipping loading local browser cookies. {e}")
+            if valid_browser_cookies == 0 and verbose:
+                logger.debug(
+                    "Skipping loading local browser cookies. Login to gemini.google.com in your browser first."
+                )
+        except ImportError:
+            if verbose:
+                logger.debug(
+                    "Skipping loading local browser cookies. Optional dependency 'browser-cookie3' is not installed."
+                )
+        except Exception as e:
+            if verbose:
+                logger.warning(f"Skipping loading local browser cookies. {e}")
 
     if not tasks:
         raise AuthError(
             "No valid cookies available for initialization. Please pass __Secure-1PSID and __Secure-1PSIDTS manually."
         )
 
-    for i, future in enumerate(asyncio.as_completed(tasks)):
-        try:
-            response, request_cookies = await future
-            snlm0e = re.search(r'"SNlM0e":\s*"(.*?)"', response.text)
-            if snlm0e:
-                cfb2h = re.search(r'"cfb2h":\s*"(.*?)"', response.text)
-                fdrfje = re.search(r'"FdrFJe":\s*"(.*?)"', response.text)
+    try:
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            try:
+                response, request_cookies = await future
+                snlm0e = re.search(r'"SNlM0e":\s*"(.*?)"', response.text)
+                if snlm0e:
+                    cfb2h = re.search(r'"cfb2h":\s*"(.*?)"', response.text)
+                    fdrfje = re.search(r'"FdrFJe":\s*"(.*?)"', response.text)
+                    if verbose:
+                        logger.debug(
+                            f"Init attempt ({i + 1}/{len(tasks)}) succeeded. Initializing client..."
+                        )
+                    return (
+                        snlm0e.group(1),
+                        cfb2h.group(1) if cfb2h else None,
+                        fdrfje.group(1) if fdrfje else None,
+                        request_cookies,
+                    )
+                elif verbose:
+                    logger.debug(
+                        f"Init attempt ({i + 1}/{len(tasks)}) failed. Cookies invalid."
+                    )
+            except Exception as e:
                 if verbose:
                     logger.debug(
-                        f"Init attempt ({i + 1}/{len(tasks)}) succeeded. Initializing client..."
+                        f"Init attempt ({i + 1}/{len(tasks)}) failed with error: {e}"
                     )
-                return (
-                    snlm0e.group(1),
-                    cfb2h.group(1) if cfb2h else None,
-                    fdrfje.group(1) if fdrfje else None,
-                    request_cookies,
-                )
-            elif verbose:
-                logger.debug(
-                    f"Init attempt ({i + 1}/{len(tasks)}) failed. Cookies invalid."
-                )
-        except Exception as e:
-            if verbose:
-                logger.debug(
-                    f"Init attempt ({i + 1}/{len(tasks)}) failed with error: {e}"
-                )
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     raise AuthError(
         "Failed to initialize client. SECURE_1PSIDTS could get expired frequently, please make sure cookie values are up to date. "

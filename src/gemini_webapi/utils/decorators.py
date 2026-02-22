@@ -1,12 +1,13 @@
 import asyncio
 import functools
 import inspect
+import random
 from collections.abc import Callable
 
 from ..exceptions import APIError
 
 
-DELAY_FACTOR = 5
+DELAY_FACTOR = 8
 
 
 def running(retry: int = 0) -> Callable:
@@ -47,9 +48,16 @@ def running(retry: int = 0) -> Callable:
 
                     async for item in func(client, *args, **kwargs):
                         yield item
-                except APIError:
+                except APIError as e:
                     if current_retry > 0:
-                        delay = (retry - current_retry + 1) * DELAY_FACTOR
+                        attempt = retry - current_retry + 1
+                        jitter = random.uniform(0, DELAY_FACTOR / 2)
+                        delay = attempt * DELAY_FACTOR + jitter
+                        from .logger import logger
+                        logger.warning(
+                            f"{func.__name__}: APIError ({e}). "
+                            f"Retry {attempt}/{retry} in {delay:.1f}s..."
+                        )
                         await asyncio.sleep(delay)
                         async for item in wrapper(
                             client, *args, current_retry=current_retry - 1, **kwargs
@@ -84,9 +92,16 @@ def running(retry: int = 0) -> Callable:
                         )
 
                     return await func(client, *args, **kwargs)
-                except APIError:
+                except APIError as e:
                     if current_retry > 0:
-                        delay = (retry - current_retry + 1) * DELAY_FACTOR
+                        attempt = retry - current_retry + 1
+                        jitter = random.uniform(0, DELAY_FACTOR / 2)
+                        delay = attempt * DELAY_FACTOR + jitter
+                        from .logger import logger
+                        logger.warning(
+                            f"{func.__name__}: APIError ({e}). "
+                            f"Retry {attempt}/{retry} in {delay:.1f}s..."
+                        )
                         await asyncio.sleep(delay)
 
                         return await wrapper(
