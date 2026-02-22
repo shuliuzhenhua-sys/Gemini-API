@@ -518,6 +518,15 @@ class GeminiClient(GemMixin):
                     if isinstance(file, io.BytesIO):
                         file.close()
 
+    @staticmethod
+    def _should_reset_watchdog(
+        got_update: bool, is_thinking: bool, is_queueing: bool
+    ) -> bool:
+        """
+        Treat queueing/thinking as active progress to avoid false stall timeouts.
+        """
+        return got_update or is_thinking or is_queueing
+
     @running(retry=5)
     async def _generate(
         self,
@@ -870,7 +879,11 @@ class GeminiClient(GemMixin):
                         yield out
                         got_update = True
 
-                    if got_update or is_thinking:
+                    if self._should_reset_watchdog(
+                        got_update=got_update,
+                        is_thinking=is_thinking,
+                        is_queueing=is_queueing,
+                    ):
                         last_progress_time = time.time()
                         session_state["last_progress_time"] = last_progress_time
                     else:
